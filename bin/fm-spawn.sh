@@ -42,6 +42,13 @@
 #   or herdr), refuses unless the endpoint's shell is sitting in the recorded
 #   worktree, and clears the previous harness's per-task wiring before arming
 #   the new incarnation.
+#   A claude task's recorded account (claude_config_dir=) comes from that record
+#   too, but has no flag of its own and refuses nothing. Those flags name a value
+#   the caller passes, so a contradicting one is worth reporting; the account
+#   instead arrives in the ambient environment, which firstmate always has set to
+#   its OWN account, so an ambient value during a relaunch cannot be read as an
+#   intentional override and is ignored rather than refused. Moving a task to
+#   another account is a fresh dispatch decision.
 #   --harness <name> is the explicit per-spawn harness/profile adapter. The old
 #   positional harness arg still works for back-compat.
 #   --model <name> and --effort <low|medium|high|xhigh|max|ultra> are concrete profile
@@ -291,6 +298,29 @@
 # and every refusal; a failed registration stops this spawn rather than launching
 # a worker that would wedge on the dialog. A --secondmate launch never runs it,
 # so a claude secondmate home keeps its own one-time trust decision.
+# A claude spawn also records WHICH account it launched against. A caller routes
+# a worker to one of several logged-in Claude accounts by setting
+# CLAUDE_CONFIG_DIR for the spawn; the launch carries that value and the trust
+# entry lands in that account's own store. A set value is written to the task
+# record as claude_config_dir=<absolute path>, and --relaunch reuses the recorded
+# value for both the trust registration and the launch instead of inheriting
+# firstmate's own environment. Only a caller-chosen account is recorded, so an
+# absent claude_config_dir= means the default single-store install, which needs
+# neither a trust-store override nor a launch prefix, and every record written
+# before this field existed stays valid. The residual: while firstmate itself
+# runs on a non-default account, such a record relaunches onto the default store
+# rather than onto firstmate's own account, a one-time window that closes the
+# first time that task is respawned. A relative value is refused rather than
+# resolved, from the environment and from the record alike, because the two
+# sides would otherwise name different stores.
+# claude* is the AUTHORITATIVE harness pattern for all three account sites - the
+# resolution, the trust registration, and the launch prefix - and it is the same
+# pattern the per-task busy-state wiring already arms on, because a task launched
+# from a raw command records that command's basename rather than the exact
+# adapter name. Do not narrow any one of them to an exact `claude`: a task on a
+# claude-prefixed adapter would then have its worktree trusted in the resolved
+# account while its launch carried no account at all, so the worker would start
+# on the default store and meet the very dialog this registration removes.
 # Every claude launch also carries the attribution-off policy in its per-launch
 # --settings JSON, so a spawned worker never writes a Co-Authored-By trailer,
 # Claude-Session link, or generated-with line into a commit or PR body;
@@ -1646,6 +1676,54 @@ if [ "$KIND" = secondmate ] && [ "$HARNESS" = rovo ]; then
   echo "error: rovo is a verified crewmate/scout adapter only and cannot run a secondmate; it has no primary supervision protocol. Select a harness verified for secondmates." >&2
   exit 1
 fi
+
+# The claude account this task's worker runs under (header above owns the
+# contract). Resolved once here, at the first point the harness is final and
+# before either consumer runs, so the trust pre-registration and the launch
+# prefix can never name different stores - a launch pointing anywhere but the
+# store its worktree was trusted in meets the dialog firstmate cannot answer.
+# A fresh spawn takes the account from its own environment. A relaunch takes it
+# from the task's own record instead, exactly as it takes backend, kind, mode,
+# yolo and worktree, because bin/fm-control.sh rebuilds the launch inside
+# firstmate's own process, whose CLAUDE_CONFIG_DIR names FIRSTMATE's account
+# rather than the worker's.
+CLAUDE_ACCOUNT_DIR=
+case "$HARNESS" in
+  claude*)
+    # A relative value resolves against this process's cwd but is read by the
+    # worker's own pane, so the two sides can name different stores. Refuse it
+    # rather than resolve it, for the same reason bin/fm-claude-trust.sh does.
+    # Each source is judged where it is taken, so the refusal names the side the
+    # operator has to correct.
+    # The recorded value is judged here for every kind, including the crewmate
+    # kinds whose spawn calls bin/fm-claude-trust.sh moments later and would meet
+    # the same refusal there. The overlap is deliberate: this script validates
+    # its own input where it reads it, and leaning on another script to validate
+    # it is exactly the cross-script coupling this account plumbing exists to
+    # remove. Narrowing the guard to KIND=secondmate - the one kind that skips
+    # the helper - was considered and rejected, because it would tie this
+    # guard's correctness to which kinds happen to call the helper, and would rot
+    # silently the day that changes.
+    # An empty value is the default single-store install: it needs no trust-store
+    # override and no launch prefix, so an absent record field keeps meaning the
+    # default store on both sides (the header above owns that contract).
+    if [ "$RELAUNCH" -eq 1 ]; then
+      CLAUDE_ACCOUNT_DIR=$(fm_meta_get "$RELAUNCH_META" claude_config_dir)
+    else
+      CLAUDE_ACCOUNT_DIR=${CLAUDE_CONFIG_DIR:-}
+    fi
+    case $CLAUDE_ACCOUNT_DIR in
+      ''|/*) ;;
+      *)
+        if [ "$RELAUNCH" -eq 1 ]; then
+          echo "error: task $ID's recorded claude account directory '$CLAUDE_ACCOUNT_DIR' is a relative path, so the store the replacement worker reads cannot be guaranteed to be the one its worktree was trusted in; correct claude_config_dir= in the task record to an absolute path" >&2
+        else
+          echo "error: CLAUDE_CONFIG_DIR '$CLAUDE_ACCOUNT_DIR' is a relative path, so the store the worker reads cannot be guaranteed to be the one written here; set it to an absolute path" >&2
+        fi
+        exit 1 ;;
+    esac
+    ;;
+esac
 
 case "$HARNESS" in
   pi|pi-signed)
@@ -3122,7 +3200,12 @@ fi
 if [ "$KIND" != secondmate ]; then
   case "$HARNESS" in
     claude*)
-      if ! "$FM_ROOT/bin/fm-claude-trust.sh" "$WT" "$PROJ_ABS" >/dev/null; then
+      # Pass the resolved account explicitly rather than letting the helper read
+      # the ambient environment: on a relaunch the ambient value is firstmate's
+      # own account, and trusting the worktree there would leave the worker's
+      # recorded account still facing the dialog. An empty value is the
+      # single-store default and falls through to the helper's HOME resolution.
+      if ! CLAUDE_CONFIG_DIR="$CLAUDE_ACCOUNT_DIR" "$FM_ROOT/bin/fm-claude-trust.sh" "$WT" "$PROJ_ABS" >/dev/null; then
         echo "error: could not pre-register Claude workspace trust for $WT; refusing to launch a claude worker that would wedge on the trust dialog; inspect window $T" >&2
         exit 1
       fi
@@ -3596,7 +3679,7 @@ SPAWN_META_PATH=$SPAWN_META_TMP
 preserve_relaunch_meta() {
   awk -F= '
     BEGIN {
-      split("window endpoint_task_id worktree project harness kind mode yolo tasktmp model effort busy_gen spawn_gen traceparent backend herdr_session herdr_workspace_id herdr_tab_id herdr_pane_id zellij_session zellij_tab_id zellij_pane_id orca_worktree_id terminal cmux_workspace_id cmux_surface_id home projects control_relaunch_tx", keys, " ")
+      split("window endpoint_task_id worktree project harness kind mode yolo tasktmp model effort busy_gen spawn_gen traceparent backend claude_config_dir herdr_session herdr_workspace_id herdr_tab_id herdr_pane_id zellij_session zellij_tab_id zellij_pane_id orca_worktree_id terminal cmux_workspace_id cmux_surface_id home projects control_relaunch_tx", keys, " ")
       for (i in keys) owned[keys[i]] = 1
     }
     !($1 in owned)
@@ -3621,6 +3704,12 @@ preserve_relaunch_meta() {
   # default path's meta stays byte-identical (absent backend= means tmux;
   # data/fm-backend-design-d7's P1 compatibility contract).
   [ "$BACKEND" = tmux ] || echo "backend=$BACKEND"
+  # claude_config_dir= records which claude account this task's worker was
+  # launched against, so --relaunch reuses it instead of inheriting firstmate's
+  # own. Written only for a caller-chosen (set) account, on the same condition as
+  # the launch prefix further down, so the default single-store path's meta stays
+  # byte-identical and an absent line keeps meaning the default store.
+  [ -z "$CLAUDE_ACCOUNT_DIR" ] || echo "claude_config_dir=$CLAUDE_ACCOUNT_DIR"
   if [ "$BACKEND" = herdr ]; then
     echo "herdr_session=$HERDR_SES"
     echo "herdr_workspace_id=$HERDR_WORKSPACE_ID"
@@ -3784,12 +3873,19 @@ esac
 # inherit firstmate's current environment, so a bare `claude` in the pane falls
 # back to the default ~/.claude store even when firstmate itself runs under a
 # different CLAUDE_CONFIG_DIR (for example a work-vs-personal subscription split).
-# Forward firstmate's own resolved store onto the claude launch so the crewmate
-# uses the same credential/config firstmate is authenticated with. Only when set;
-# an unset value is the single-store default and needs no prefix.
-if [ "$HARNESS" = claude ] && [ -n "${CLAUDE_CONFIG_DIR:-}" ]; then
-  LAUNCH="CLAUDE_CONFIG_DIR=$(shell_quote "$CLAUDE_CONFIG_DIR") $LAUNCH"
-fi
+# Forward this task's resolved store onto the claude launch so the crewmate uses
+# the same credential/config its worktree was trusted in. Only when set; an unset
+# value is the single-store default and needs no prefix. CLAUDE_ACCOUNT_DIR, not
+# the ambient variable: on a relaunch the account comes from the task's own
+# record rather than from firstmate's own process.
+# The pattern is claude*, matching the resolution and the trust registration
+# (header above owns why it must stay that way).
+case "$HARNESS" in
+  claude*)
+    [ -z "$CLAUDE_ACCOUNT_DIR" ] \
+      || LAUNCH="CLAUDE_CONFIG_DIR=$(shell_quote "$CLAUDE_ACCOUNT_DIR") $LAUNCH"
+    ;;
+esac
 if [ "$KIND" = secondmate ]; then
   sq_home=$(shell_quote "$PROJ_ABS")
   sq_primary_home=$(shell_quote "$FM_HOME")

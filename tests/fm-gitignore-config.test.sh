@@ -43,6 +43,30 @@ test_unrelated_path_stays_visible() {
   pass "an unrelated path outside config/ remains visible to git"
 }
 
+# .omc/ is agent runtime state (plans, logs, session records, project memory).
+# An agent writes it into whatever checkout it happens to run in - including a
+# throwaway gate worktree - so none of it may read as a repository change. The
+# rule is blanket, like the sibling agent-scratch rules scratchpad*,
+# .no-mistakes/ and .lavish/: nothing under .omc/ is committable here.
+test_omc_runtime_state_is_ignored_as_a_category() {
+  local sample
+  for sample in .omc/project-memory.json .omc/notepad.md \
+    ".omc/sessions/$(random_leaf s).json" ".omc/plans/$(random_leaf p).md" \
+    ".omc/state/$(random_leaf k)" ".omc/skills/$(random_leaf s)/SKILL.md"; do
+    git -C "$ROOT" check-ignore -q "$sample" \
+      || fail "git does not ignore $sample (.omc/ must be ignored as a directory)"
+  done
+  pass ".omc/ is ignored as a directory, covering every runtime-state path under it"
+}
+
+test_omc_runtime_state_ignores_no_tracked_path() {
+  local tracked
+  tracked=$(git -C "$ROOT" ls-files -- .omc)
+  [ -z "$tracked" ] \
+    || fail "tracked .omc paths are now ignored, so they would read as deleted: $tracked"
+  pass "no .omc path is tracked, so the ignore rule contradicts nothing"
+}
+
 test_scratchpad_prefix_is_ignored() {
   local sample
   for sample in scratchpad scratchpad2/file scratchpad-foo scratchpad/tmp; do
@@ -84,6 +108,8 @@ test_scratchpad2_does_not_dirty_porcelain() {
 
 test_config_dir_ignored_as_category
 test_unrelated_path_stays_visible
+test_omc_runtime_state_is_ignored_as_a_category
+test_omc_runtime_state_ignores_no_tracked_path
 test_scratchpad_prefix_is_ignored
 test_scratchpad_prefix_ignores_no_tracked_path
 test_scratchpad2_does_not_dirty_porcelain
